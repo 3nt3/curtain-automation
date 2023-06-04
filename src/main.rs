@@ -32,9 +32,10 @@ fn main() {
     let sysloop = EspSystemEventLoop::take().unwrap();
 
     // setup pins
+    let mut led_pin = PinDriver::output(peripherals.pins.gpio2).unwrap();
+
     let mut step_pin = PinDriver::output(peripherals.pins.gpio22).unwrap();
     let mut direction_pin = PinDriver::output(peripherals.pins.gpio23).unwrap();
-    let mut led_pin = PinDriver::output(peripherals.pins.gpio2).unwrap();
 
     led_pin.set_high().unwrap();
 
@@ -52,8 +53,10 @@ fn main() {
     let mqtt_host = "homeassistant";
     let broker_url = format!("mqtt://{}:{}@{}", mqtt_user, mqtt_password, mqtt_host);
     let mqtt_config = MqttClientConfiguration::default();
-    let mut mqtt_client =
-        EspMqttClient::new(broker_url, &mqtt_config, on_message_received).unwrap();
+    let mut mqtt_client = EspMqttClient::new(broker_url, &mqtt_config, move |message| {
+        on_message_received(message, &mut step_pin, &mut direction_pin)
+    })
+    .unwrap();
 
     mqtt_client
         .subscribe("/curtains/#", embedded_svc::mqtt::client::QoS::AtLeastOnce)
@@ -65,17 +68,33 @@ fn main() {
     loop {
         info!("loop");
 
-        step_motor(&mut step_pin, &mut direction_pin, 10);
-        std::thread::sleep(Duration::from_secs(1));
-        step_motor(&mut step_pin, &mut direction_pin, -10);
         std::thread::sleep(Duration::from_secs(1));
     }
 }
 
-fn on_message_received(message: &std::result::Result<Event<EspMqttMessage>, EspError>) {
+fn on_message_received<T: OutputPin, U: OutputPin>(
+    message: &std::result::Result<Event<EspMqttMessage>, EspError>,
+    step_pin: &mut PinDriver<T, Output>,
+    direction_pin: &mut PinDriver<U, Output>,
+) {
     match message {
         Ok(Event::Received(message)) => {
             info!("Received message: {:?}", message);
+
+            let topic = message.topic().unwrap();
+
+            match topic {
+                "/curtains/step" => {
+                    let payload = String::from_utf8(message.data().to_vec()).unwrap();
+                    let steps: i16 = payload.parse().unwrap();
+
+                    // let steps: i16 = payload.parse().unwrap();
+                    step_motor(step_pin, direction_pin, steps);
+                }
+                _ => {
+                    error!("Unknown topic: {:?}", topic);
+                }
+            }
         }
         Ok(Event::Connected(is_connected)) => {
             info!("Connected: {:?}", is_connected);
@@ -89,15 +108,16 @@ fn on_message_received(message: &std::result::Result<Event<EspMqttMessage>, EspE
     }
 }
 
-fn step_motor<T, U>(step_pin: &mut PinDriver<T, Output>, direction_pin: &mut PinDriver<U, Output>, steps: i16)
-where
-    T: OutputPin,
-    U: OutputPin
-{
-
+fn step_motor<T: OutputPin, U: OutputPin>(
+    step_pin: &mut PinDriver<T, Output>,
+    direction_pin: &mut PinDriver<U, Output>,
+    steps: i16,
+) {
     info!("stepping motor {} steps", steps);
 
     let step_delay = Duration::from_micros(700);
+
+    // positive is right, negative is left
     if steps > 0 {
         direction_pin.set_high().unwrap();
     } else {
