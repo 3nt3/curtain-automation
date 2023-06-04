@@ -1,15 +1,17 @@
 use std::time::Duration;
 
 use anyhow::bail;
-use embedded_svc::wifi::{
-    AccessPointConfiguration, AuthMethod, ClientConfiguration, Configuration,
+use embedded_svc::{
+    mqtt::client::Event,
+    wifi::{AccessPointConfiguration, AuthMethod, ClientConfiguration, Configuration},
 };
 use esp_idf_hal::{peripheral, prelude::*};
 use esp_idf_svc::{
     eventloop::EspSystemEventLoop,
+    mqtt::client::{EspMqttClient, EspMqttMessage, MqttClientConfiguration},
     wifi::{AsyncWifi, BlockingWifi, EspWifi},
 };
-use esp_idf_sys as _; // If using the `binstart` feature of `esp-idf-sys`, always keep this module imported
+use esp_idf_sys::{self as _, EspError}; // If using the `binstart` feature of `esp-idf-sys`, always keep this module imported
 use log::*;
 
 fn main() {
@@ -18,6 +20,9 @@ fn main() {
     esp_idf_sys::link_patches();
     // Bind the log crate to the ESP Logging facilities
     esp_idf_svc::log::EspLogger::initialize_default();
+    unsafe {
+        esp_idf_sys::nvs_flash_init();
+    }
 
     let peripherals = Peripherals::take().unwrap();
     let sysloop = EspSystemEventLoop::take().unwrap();
@@ -29,8 +34,40 @@ fn main() {
         sysloop,
     );
 
-    info!("Hello, world!");
+    // mqtt configuration
+    let mqtt_user = "curtains";
+    let mqtt_password = "m0YO9sTtYomkWuzj";
+    let mqtt_host = "homeassistant";
+    let broker_url = format!("mqtt://{}:{}@{}", mqtt_user, mqtt_password, mqtt_host);
+    let mqtt_config = MqttClientConfiguration::default();
+    let mut mqtt_client =
+        EspMqttClient::new(broker_url, &mqtt_config, on_message_received).unwrap();
 
+    mqtt_client
+        .subscribe("/curtains/#", embedded_svc::mqtt::client::QoS::AtLeastOnce)
+        .unwrap();
+
+    loop {
+        info!("loop");
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn on_message_received(message: &std::result::Result<Event<EspMqttMessage>, EspError>) {
+    match message {
+        Ok(Event::Received(message)) => {
+            info!("Received message: {:?}", message);
+        }
+        Ok(Event::Connected(is_connected)) => {
+            info!("Connected: {:?}", is_connected);
+        }
+        Err(e) => {
+            error!("Error receiving message: {:?}", e);
+        }
+        _ => {
+            error!("Unknown message received: {:?}", message);
+        }
+    }
 }
 
 fn wifi(
