@@ -5,7 +5,11 @@ use embedded_svc::{
     mqtt::client::Event,
     wifi::{AccessPointConfiguration, AuthMethod, ClientConfiguration, Configuration},
 };
-use esp_idf_hal::{peripheral, prelude::*};
+use esp_idf_hal::{
+    gpio::{AnyOutputPin, Level, Output, OutputPin, PinDriver, Pins},
+    peripheral,
+    prelude::*,
+};
 use esp_idf_svc::{
     eventloop::EspSystemEventLoop,
     mqtt::client::{EspMqttClient, EspMqttMessage, MqttClientConfiguration},
@@ -27,6 +31,14 @@ fn main() {
     let peripherals = Peripherals::take().unwrap();
     let sysloop = EspSystemEventLoop::take().unwrap();
 
+    // setup pins
+    let mut step_pin = PinDriver::output(peripherals.pins.gpio22).unwrap();
+    let mut direction_pin = PinDriver::output(peripherals.pins.gpio23).unwrap();
+    let mut led_pin = PinDriver::output(peripherals.pins.gpio2).unwrap();
+
+    led_pin.set_high().unwrap();
+
+    // connect to wifi
     let _wifi = wifi(
         "FRITZ!Box 7530 QQ",
         "41988153788532892373",
@@ -47,8 +59,15 @@ fn main() {
         .subscribe("/curtains/#", embedded_svc::mqtt::client::QoS::AtLeastOnce)
         .unwrap();
 
+    // turn off led when connected to everything successfully
+    led_pin.set_low().unwrap();
+
     loop {
         info!("loop");
+
+        step_motor(&mut step_pin, &mut direction_pin, 10);
+        std::thread::sleep(Duration::from_secs(1));
+        step_motor(&mut step_pin, &mut direction_pin, -10);
         std::thread::sleep(Duration::from_secs(1));
     }
 }
@@ -67,6 +86,29 @@ fn on_message_received(message: &std::result::Result<Event<EspMqttMessage>, EspE
         _ => {
             error!("Unknown message received: {:?}", message);
         }
+    }
+}
+
+fn step_motor<T, U>(step_pin: &mut PinDriver<T, Output>, direction_pin: &mut PinDriver<U, Output>, steps: i16)
+where
+    T: OutputPin,
+    U: OutputPin
+{
+
+    info!("stepping motor {} steps", steps);
+
+    let step_delay = Duration::from_micros(700);
+    if steps > 0 {
+        direction_pin.set_high().unwrap();
+    } else {
+        direction_pin.set_low().unwrap();
+    }
+
+    for _ in 0..steps.abs() {
+        step_pin.set_high().unwrap();
+        std::thread::sleep(step_delay);
+        step_pin.set_low().unwrap();
+        std::thread::sleep(step_delay);
     }
 }
 
