@@ -1,4 +1,9 @@
-use std::time::Duration;
+#![feature(once_cell)]
+
+use std::{
+    sync::{Arc, OnceLock, Mutex},
+    time::Duration,
+};
 
 use embedded_svc::{
     mqtt::client::Event,
@@ -12,13 +17,18 @@ use esp_idf_hal::{
 use esp_idf_svc::{
     eventloop::EspSystemEventLoop,
     mqtt::client::{EspMqttClient, EspMqttMessage, MqttClientConfiguration},
-    wifi::{BlockingWifi, EspWifi},
+    wifi::{BlockingWifi, EspWifi, WifiDeviceId},
 };
 use esp_idf_sys::{self as _, EspError}; // If using the `binstart` feature of `esp-idf-sys`, always keep this module imported
 use log::*;
 
 mod config;
 use config::APP_CONFIG;
+
+static TOPIC_PREFIX: OnceLock<Option<String>> = OnceLock::new();
+const STEPS_TO_FULLY_OPEN: i16 = 4600;
+static CURRENT_POSITION: once_cell::sync::Lazy<Arc<Mutex<f32>>> =
+    once_cell::sync::Lazy::new(|| Arc::new(Mutex::new(0.0)));
 
 fn main() {
     // It is necessary to call this function once. Otherwise some patches to the runtime
@@ -44,12 +54,13 @@ fn main() {
     led_pin.set_high().unwrap();
 
     // connect to wifi
-    let _wifi = wifi(
+    let wifi = wifi(
         APP_CONFIG.wifi_ssid,
         APP_CONFIG.wifi_password,
         peripherals.modem,
         sysloop,
-    );
+    )
+    .unwrap();
 
     // mqtt configuration
     let broker_url = format!(
@@ -57,22 +68,49 @@ fn main() {
         APP_CONFIG.mqtt_username, APP_CONFIG.mqtt_password, APP_CONFIG.mqtt_host
     );
     let mqtt_config = MqttClientConfiguration::default();
+    homing_sequence(&mut step_pin, &mut direction_pin);
+
     let mut mqtt_client = EspMqttClient::new(broker_url, &mqtt_config, move |message| {
         on_message_received(message, &mut step_pin, &mut direction_pin)
     })
     .unwrap();
 
+    // get mac address
+    let mac_address = wifi
+        .get_mac(WifiDeviceId::Sta)
+        .map_err(|why| {
+            error!("Error getting mac address: {:?}", why);
+        })
+        .unwrap();
+    let mac_address_str = mac_address
+        .to_vec()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<Vec<String>>()
+        .join(":");
+
+    let topic_prefix = format!("/curtains/{}", mac_address_str);
+    TOPIC_PREFIX.set(Some(topic_prefix.clone())).unwrap();
+
+    let topic = format!("{}/#", &topic_prefix);
+    info!("subscribing to topic {}", topic);
+
     mqtt_client
-        .subscribe("/curtains/#", embedded_svc::mqtt::client::QoS::AtLeastOnce)
+        .subscribe(&topic, embedded_svc::mqtt::client::QoS::AtLeastOnce)
         .unwrap();
 
     // turn off led when connected to everything successfully
     led_pin.set_low().unwrap();
 
     loop {
-        info!("loop");
+        std::thread::sleep(Duration::from_secs(10));
 
-        std::thread::sleep(Duration::from_secs(1));
+        mqtt_client.publish(
+            format!("{}/position", &topic_prefix).as_str(),
+            embedded_svc::mqtt::client::QoS::AtLeastOnce,
+            false,
+            format!("{}", CURRENT_POSITION.lock().unwrap()).as_bytes(),
+        ).unwrap();
     }
 }
 
@@ -85,15 +123,24 @@ fn on_message_received<T: OutputPin, U: OutputPin>(
         Ok(Event::Received(message)) => {
             info!("Received message: {:?}", message);
 
-            let topic = message.topic().unwrap();
+            let topic_prefix = TOPIC_PREFIX.get().unwrap().as_ref().unwrap();
 
-            match topic {
-                "/curtains/step" => {
+            let topic = message.topic().unwrap();
+            let topic = topic.replace(topic_prefix.as_str(), "");
+
+            match topic.as_str() {
+                "/step" => {
                     let payload = String::from_utf8(message.data().to_vec()).unwrap();
                     let steps: i16 = payload.parse().unwrap();
 
                     // let steps: i16 = payload.parse().unwrap();
                     step_motor(step_pin, direction_pin, steps);
+                }
+                "/set-position" => {
+                    let payload = String::from_utf8(message.data().to_vec()).unwrap();
+                    let position: f32 = payload.parse().unwrap();
+
+                    set_position(step_pin, direction_pin, position);
                 }
                 _ => {
                     error!("Unknown topic: {:?}", topic);
@@ -117,8 +164,6 @@ fn step_motor<T: OutputPin, U: OutputPin>(
     direction_pin: &mut PinDriver<U, Output>,
     steps: i16,
 ) {
-    info!("stepping motor {} steps", steps);
-
     let step_delay = Duration::from_micros(700);
 
     // positive is right, negative is left
@@ -134,6 +179,48 @@ fn step_motor<T: OutputPin, U: OutputPin>(
         step_pin.set_low().unwrap();
         std::thread::sleep(step_delay);
     }
+    let mut current_position = CURRENT_POSITION.lock().unwrap();
+
+    let new_position =
+        (*current_position + steps as f32 / STEPS_TO_FULLY_OPEN as f32).clamp(0.0, 1.0);
+    info!("current_position: {}, new position: {}", current_position, new_position);
+    *current_position = new_position;
+}
+
+/// Set the position of the curtains in terms of 0-1
+fn set_position<T: OutputPin, U: OutputPin>(
+    step_pin: &mut PinDriver<T, Output>,
+    direction_pin: &mut PinDriver<U, Output>,
+    position: f32,
+) {
+    let current_position = CURRENT_POSITION.lock().unwrap();
+    let current_position_as_steps = (*current_position * STEPS_TO_FULLY_OPEN as f32) as i16;
+    drop(current_position);
+
+    let delta_steps = (position * STEPS_TO_FULLY_OPEN as f32) as i16 - current_position_as_steps;
+
+    info!(
+        "setting position to {} using {} steps delta",
+        position, delta_steps
+    );
+    step_motor(step_pin, direction_pin, delta_steps);
+}
+
+fn homing_sequence<T: OutputPin, U: OutputPin>(
+    step_pin: &mut PinDriver<T, Output>,
+    direction_pin: &mut PinDriver<U, Output>,
+) {
+    info!("running homing sequence");
+
+    // TODO: this should use one/two limit switch(es)
+
+    // move left for STEPS_TO_FULLY_OPEN steps, this should open the curtain completely
+    // the stepper driver does current limiting so it should be fine to just run it into the end
+    // — still very unelegant and sounds horrible when it hits the too early
+    step_motor(step_pin, direction_pin, -STEPS_TO_FULLY_OPEN);
+
+    let mut current_position = CURRENT_POSITION.lock().unwrap();
+    *current_position = 0.0;
 }
 
 fn wifi(
