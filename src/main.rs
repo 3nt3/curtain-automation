@@ -1,22 +1,24 @@
 use std::time::Duration;
 
-use anyhow::bail;
 use embedded_svc::{
     mqtt::client::Event,
-    wifi::{AccessPointConfiguration, AuthMethod, ClientConfiguration, Configuration},
+    wifi::{AccessPointConfiguration, ClientConfiguration, Configuration},
 };
 use esp_idf_hal::{
-    gpio::{AnyOutputPin, Level, Output, OutputPin, PinDriver, Pins},
+    gpio::{Output, OutputPin, PinDriver},
     peripheral,
     prelude::*,
 };
 use esp_idf_svc::{
     eventloop::EspSystemEventLoop,
     mqtt::client::{EspMqttClient, EspMqttMessage, MqttClientConfiguration},
-    wifi::{AsyncWifi, BlockingWifi, EspWifi},
+    wifi::{BlockingWifi, EspWifi},
 };
 use esp_idf_sys::{self as _, EspError}; // If using the `binstart` feature of `esp-idf-sys`, always keep this module imported
 use log::*;
+
+mod config;
+use config::APP_CONFIG;
 
 fn main() {
     // It is necessary to call this function once. Otherwise some patches to the runtime
@@ -31,6 +33,8 @@ fn main() {
     let peripherals = Peripherals::take().unwrap();
     let sysloop = EspSystemEventLoop::take().unwrap();
 
+    info!("config: {:?}", &APP_CONFIG);
+
     // setup pins
     let mut led_pin = PinDriver::output(peripherals.pins.gpio2).unwrap();
 
@@ -41,17 +45,17 @@ fn main() {
 
     // connect to wifi
     let _wifi = wifi(
-        "FRITZ!Box 7530 QQ",
-        "41988153788532892373",
+        APP_CONFIG.wifi_ssid,
+        APP_CONFIG.wifi_password,
         peripherals.modem,
         sysloop,
     );
 
     // mqtt configuration
-    let mqtt_user = "curtains";
-    let mqtt_password = "m0YO9sTtYomkWuzj";
-    let mqtt_host = "homeassistant";
-    let broker_url = format!("mqtt://{}:{}@{}", mqtt_user, mqtt_password, mqtt_host);
+    let broker_url = format!(
+        "mqtt://{}:{}@{}",
+        APP_CONFIG.mqtt_username, APP_CONFIG.mqtt_password, APP_CONFIG.mqtt_host
+    );
     let mqtt_config = MqttClientConfiguration::default();
     let mut mqtt_client = EspMqttClient::new(broker_url, &mqtt_config, move |message| {
         on_message_received(message, &mut step_pin, &mut direction_pin)
